@@ -93,6 +93,27 @@ fn parse_mac_str(s: &str) -> Option<[u8; 6]> {
 }
 
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Keeps at most one DevicePoll queued. A poll can outlast the interval (a pump
+/// read that times out blocks for 2 s), and unconditional sends then grow the
+/// event queue without bound, starving IPC events queued behind it.
+struct PollGate(AtomicBool);
+
+impl PollGate {
+    const fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    fn try_queue(&self) -> bool {
+        !self.0.swap(true, Ordering::AcqRel)
+    }
+
+    fn dequeued(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+static DEVICE_POLL_GATE: PollGate = PollGate::new();
 /// Full USB bus enumeration interval — only needed for hot-plug detection of
 /// wired USB devices (LCD, AIO, etc.). Wireless discovery uses its own RX polling.
 const USB_ENUM_INTERVAL: Duration = Duration::from_secs(10);
@@ -586,6 +607,9 @@ impl ServiceManager {
         let device_tx = tx.clone();
         thread::spawn(move || loop {
             thread::sleep(DEVICE_POLL_INTERVAL);
+            if !DEVICE_POLL_GATE.try_queue() {
+                continue;
+            }
             if device_tx.send(DaemonEvent::DevicePoll).is_err() {
                 break;
             }
@@ -718,6 +742,7 @@ impl ServiceManager {
                     }
                 }
                 DaemonEvent::DevicePoll => {
+                    DEVICE_POLL_GATE.dequeued();
                     self.poll_startup_image();
                     self.refresh_after_mode_switch();
                     self.check_pixel_clean_sessions();
@@ -1066,5 +1091,29 @@ impl ServiceManager {
         stream_worker.stop();
         self.shutdown();
         Ok(self.restart_requested && !signals.requested())
+    }
+}
+
+#[cfg(test)]
+mod poll_gate_tests {
+    use super::PollGate;
+
+    #[test]
+    fn slow_polls_never_queue_more_than_one_event() {
+        // The producer ticks every interval; each poll takes two intervals.
+        let gate = PollGate::new();
+        let mut queued = 0usize;
+        let mut peak = 0usize;
+        for tick in 0..100 {
+            if gate.try_queue() {
+                queued += 1;
+            }
+            peak = peak.max(queued);
+            if tick % 2 == 1 && queued > 0 {
+                queued -= 1;
+                gate.dequeued();
+            }
+        }
+        assert_eq!(peak, 1);
     }
 }
