@@ -8,13 +8,21 @@ use anyhow::{Context, Result};
 use lianli_shared::rgb::{
     RgbEffect, RgbMode, RgbPlaybackTiming, RgbRenderFamily, RgbRenderProfile, RgbZoneInfo,
 };
-use lianli_transport::usb::{RusbBulk, LCD_READ_TIMEOUT, LCD_WRITE_TIMEOUT};
+use lianli_transport::usb::{RusbBulk, EP_IN, LCD_WRITE_TIMEOUT};
 use parking_lot::Mutex;
 use rusb::{Device, GlobalContext};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, info};
 
 const PACKET_SIZE: usize = 8;
+
+/// Replies are longer than the 8-byte commands (the version reply alone
+/// carries a 32-byte string). Reading into a smaller buffer overflows, and
+/// the endpoint recovery that follows desyncs the data toggle so the next
+/// reply is dropped and its read times out.
+const REPLY_SIZE: usize = 64;
+const REPLY_TIMEOUT: Duration = Duration::from_millis(200);
 
 // Opcodes
 const CMD_GET_VER: u8 = 0x10;
@@ -97,11 +105,14 @@ impl Hs2OledLedController {
         })
     }
 
-    fn send_and_read(&self, tx: &[u8; PACKET_SIZE]) -> Result<[u8; PACKET_SIZE]> {
+    fn send_and_read(&self, tx: &[u8; PACKET_SIZE]) -> Result<[u8; REPLY_SIZE]> {
         let transport = self.transport.lock();
         transport.write_full(tx, LCD_WRITE_TIMEOUT)?;
-        let mut rx = [0u8; PACKET_SIZE];
-        let result = transport.read(&mut rx, LCD_READ_TIMEOUT);
+        let mut rx = [0u8; REPLY_SIZE];
+        let result = transport.read(&mut rx, REPLY_TIMEOUT);
+        if result.is_err() {
+            let _ = transport.clear_halt(EP_IN);
+        }
         if matches!(tx[0], CMD_GET_VER | CMD_GET_TEMP | CMD_GET_PUMP) {
             let len = result.context("HS2 OLED telemetry read")?;
             anyhow::ensure!(len >= 3, "short HS2 OLED telemetry response");
@@ -226,8 +237,10 @@ impl Hs2OledLedController {
             transport
                 .write(packet, LCD_WRITE_TIMEOUT)
                 .with_context(|| format!("HS2 OLED LED: write RGB chunk {chunk}"))?;
-            let mut rx = [0u8; PACKET_SIZE];
-            let _ = transport.read(&mut rx, LCD_READ_TIMEOUT);
+            let mut rx = [0u8; REPLY_SIZE];
+            if transport.read(&mut rx, REPLY_TIMEOUT).is_err() {
+                let _ = transport.clear_halt(EP_IN);
+            }
         }
         Ok(())
     }
